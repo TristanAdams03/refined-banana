@@ -119,7 +119,7 @@ static int statics(void) {
 }
 
 // ---------- Descriptor sets that do not fit a push (per submission slot) ----------
-enum { NSLOT = 8, MAXPOOLS = 64 };
+enum { NSLOT = 32, MAXPOOLS = 64 };
 static VkDescriptorPool g_dp[NSLOT][MAXPOOLS]; static int g_ndp[NSLOT], g_cur_dp[NSLOT];
 void vka_dyn_invalidate(void);
 static void drv_memo_reset(void);
@@ -127,7 +127,7 @@ void vka_draw_sub_begin(VkCommandBuffer cb, unsigned slot) {
     g_cb = cb; g_slot = slot % NSLOT; vka_dyn_invalidate();
     { void vka_mem_rec_thread(void); vka_mem_rec_thread(); }   // the address lookups' cache outside TLS for the recording thread (vka_mem.c)
     drv_memo_reset();   // the last submission's scratch spans go with its fence
-    g_prof_all = VKA_ENV("DM_VK_PROF", 0) != 0; g_prof = g_prof_all; g_prof_every = VKA_ENV("DM_VK_PACE_LOG", 5000) > 0 ? VKA_ENV("DM_VK_PACE_PROF", 16) : 0; g_dyn_filter = VKA_ENV("DM_VK_DYN_FILTER", 1); g_pass_keep = VKA_ENV("DM_VK_PASS_KEEP", 1); g_vb_filter = VKA_ENV("DM_VK_VB_FILTER", 1); g_inst_on = VKA_ENV("DM_VK_INSTANCE", 0);   // live: from this submission
+    g_prof_all = VKA_ENV("DM_VK_PROF", 0) != 0; g_prof = g_prof_all; g_prof_every = VKA_ENV("DM_VK_PACE_LOG", 5000) > 0 ? VKA_ENV("DM_VK_PACE_PROF", 16) : 0; g_dyn_filter = VKA_ENV("DM_VK_DYN_FILTER", 1); g_pass_keep = VKA_ENV("DM_VK_PASS_KEEP", 1); g_vb_filter = VKA_ENV("DM_VK_VB_FILTER", 1); g_inst_on = VKA_ENV("DM_VK_INSTANCE", 1);   // live: from this submission
     g_vin_skip = VKA_ENV("DM_VK_VIN_SKIP", 1);
     for (int i = 0; i < g_ndp[g_slot]; i++) vk.vkResetDescriptorPool(V.dev, g_dp[g_slot][i], 0);   // the slot's last submission is done (mtl_sub_begin waited for it)
     g_cur_dp[g_slot] = 0;
@@ -196,7 +196,7 @@ static int rt_same(const p_set_rt *a, int ha, const p_set_rt *b, int hb) {
 // pass of the same formats (vka_rp_compat: Vulkan's compatibility ignores loads and clears), without graphics pipeline libraries. Restart only
 int vka_classic_rp(void) {   // decided once, after the device is made (V.imageless): pipelines and passes must agree for the whole run
     static int on = -1;
-    if (on < 0 && V.dev) { const char *e = getenv("DM_VK_CLASSIC_RP"); int want = e && atoi(e) != 0; on = want && V.imageless;
+    if (on < 0 && V.dev) { const char *e = getenv("DM_VK_CLASSIC_RP"); int want = !e || !*e || atoi(e) != 0; on = want && V.imageless;
         if (on) VLOG("classic render passes (DM_VK_CLASSIC_RP)"); else if (want) VRED("classic render passes (DM_VK_CLASSIC_RP) need imagelessFramebuffer, which this device lacks: dynamic rendering"); }
     return on > 0;
 }
@@ -1346,7 +1346,7 @@ static int push_same(VkPipelineBindPoint bp, VkPipelineLayout layout) {
     // only those are pushed. Vulkan lets push descriptors be updated incrementally; the others stay as the last push left them (until the set is disturbed: a new command
     // buffer or part, a set bound in its place, which forget g_pd)
     g_dwn = 0;
-    if (VKA_ENV("DM_VK_PUSH_DELTA", 0) && g_pd[c].n == k && g_pd[c].w[0] == buf[0] && g_pd[c].w[1] == buf[1]) {
+    if (VKA_ENV("DM_VK_PUSH_DELTA", 1) && g_pd[c].n == k && g_pd[c].w[0] == buf[0] && g_pd[c].w[1] == buf[1]) {
         int ok = 1;
         for (uint32_t i = 0; i < g_w.n && ok; i++) {
             const uint64_t *a = g_pd[c].w + 2 + 4 * (size_t)i, *b = buf + 2 + 4 * (size_t)i;
@@ -1646,7 +1646,7 @@ static vka_shader *inst_variant_make(vka_shader *s, uint32_t binding);
 // The frame path and the prewarm threads (instanced variants in the prewarm list: vka_inst_variant) share the cache, so one variant is made once
 static pthread_mutex_t g_ivmu = PTHREAD_MUTEX_INITIALIZER;
 static vka_shader *inst_variant(vka_shader *s, uint32_t binding) { pthread_mutex_lock(&g_ivmu); vka_shader *v = inst_variant_make(s, binding); pthread_mutex_unlock(&g_ivmu); return v; }
-vka_shader *vka_inst_variant(vka_shader *s, uint32_t binding) { return VKA_ENV("DM_VK_INSTANCE", 0) ? inst_variant(s, binding) : NULL; }
+vka_shader *vka_inst_variant(vka_shader *s, uint32_t binding) { return VKA_ENV("DM_VK_INSTANCE", 1) ? inst_variant(s, binding) : NULL; }
 static vka_shader *inst_variant_make(vka_shader *s, uint32_t binding) {
     static struct { uint64_t key; uint32_t binding; vka_shader *v; } cache[128]; static int ncache;
     for (int i = 0; i < ncache; i++) if (cache[i].key == s->key && cache[i].binding == binding) return cache[i].v;

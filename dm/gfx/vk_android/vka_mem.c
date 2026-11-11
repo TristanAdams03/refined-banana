@@ -772,7 +772,7 @@ static int lazy_on(void) { static int v = -1; if (v < 0) { v = VKA_ENV("DM_VK_PL
 static uint64_t part_min(void) { static int64_t v = -1; if (v < 0) { v = (int64_t)VKA_ENV("DM_VK_PLACE_PART_MB", 1024) << 20; if (v < 0) v = 0; if (!v) VLOG("DM_VK_PLACE_PART_MB=0: every memory pool is placed whole"); } return (uint64_t)v; }
 static uint64_t part_gran(void) {
     static int64_t v = -1;
-    if (v < 0) { int64_t m = VKA_ENV("DM_VK_PLACE_GRANULE_MB", 16); if (m < 1) m = 1; v = m << 20; uintptr_t al = pg_align(); v = (v + (int64_t)al - 1) & ~(int64_t)(al - 1); }
+    if (v < 0) { int64_t m = VKA_ENV("DM_VK_PLACE_GRANULE_MB", 64); if (m < 1) m = 1; v = m << 20; uintptr_t al = pg_align(); v = (v + (int64_t)al - 1) & ~(int64_t)(al - 1); }
     return (uint64_t)v;
 }
 static int can_place(uint64_t size) { return size && vka_ok() && placed_on() && (V.placed || V.fd_alias); }

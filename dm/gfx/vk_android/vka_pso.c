@@ -1126,7 +1126,7 @@ static void *as_main(void *a) {
 }
 static int g_as_n;
 static void as_start(void) {
-    int v = VKA_ENV("DM_VK_PSO_ASYNC", 0); v = v < 0 ? 0 : v > 4 ? 4 : v;
+    int v = VKA_ENV("DM_VK_PSO_ASYNC", 4); v = v < 0 ? 0 : v > 4 ? 4 : v;
     for (int i = 0; i < v; i++) { pthread_t th; if (!pthread_create(&th, NULL, as_main, NULL)) { pthread_detach(th); g_as_n++; } }
     if (v) VLOG("asynchronous pipelines: %d of %d background threads (DM_VK_PSO_ASYNC): a pipeline the cache lacks is made off the frame path and its draws are skipped until then", g_as_n, v);
 }

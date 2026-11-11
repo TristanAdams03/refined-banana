@@ -275,9 +275,11 @@ static inline void im_unhold_locked(vka_img *im) {
 // The recording thread's memo of texture ID -> view (vka_tex_id_view_rec) and sampler ID -> sampler (vka_samp_id_rec): an entry holds while the ID was not registered
 // again (g_tver / g_sver, per ID) and no texture mapping was dropped or image let go since (g_tgen). It saves the table lock and the lookups 3-4 times a texture binding
 static vka_img *g_big[64]; static int g_nbig;   // large images (DM_VK_BIGIMG_MB), for the storage overlap check (big_note)
+static int g_nedge_poll;   // tracked images whose shared boundary pages are polled once a frame instead of re-protected on every neighbour write
 static void unref_locked(vka_img *im) {
     atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release);
     if (--im->refs) return;
+    if (im->edge_poll) { im->edge_poll = 0; if (g_nedge_poll > 0) g_nedge_poll--; }
     map_del_im(im);
     live_del(im);
     for (int i = 0; i < g_nbig; i++) if (g_big[i] == im) { g_big[i] = g_big[--g_nbig]; break; }
@@ -520,15 +522,26 @@ static vka_img *img_create(const tex_t *t, const vka_fmt *f, uint32_t base) {
 // residency at this shape (a dense one may be made)
 static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int res, int *why, uint64_t *need) {
     const nvn_texdesc *d = &t->d;
-    if (d->target == NVN_TEXTURE_TARGET_BUFFER) { VRED_ONCE("texture buffers are not images yet (first: serial %llu)", (unsigned long long)t->serial); return NULL; }
+    int is_tbuf = d->target == NVN_TEXTURE_TARGET_BUFFER;
+    uint32_t tbuf_w = 0, tbuf_h = 0, tbuf_row = 0;
+    if (is_tbuf && !nvn_tbuf_rows(d->width ? d->width : 1, f->bpb, 1, &tbuf_w, &tbuf_h, &tbuf_row)) {
+        VRED_ONCE("texture buffer serial %llu width %u format %#x: invalid 2D row layout", (unsigned long long)t->serial, d->width, d->format);
+        return NULL;
+    }
     vka_img *im = calloc(1, sizeof *im);
     im->serial = t->serial; im->mem = t->mem; im->d = *d; im->L = t->L; im->f = *f; im->refs = 1;
     im->last_frame = vka_frame();
     im->last_fence = vka_fence_last();
     int is3d = d->target == NVN_TEXTURE_TARGET_3D, is1d = d->target == NVN_TEXTURE_TARGET_1D || d->target == NVN_TEXTURE_TARGET_1D_ARRAY;
-    im->w = d->width ? d->width : 1; im->h = is1d ? 1 : d->height ? d->height : 1; im->depth = is3d ? (d->depth ? d->depth : 1) : 1;
+    if (is_tbuf) {
+        im->w = tbuf_w; im->h = tbuf_h; im->depth = 1;
+        im->d.flags |= NVN_TEXTURE_FLAGS_LINEAR;
+        im->d.stride = tbuf_row;
+    } else {
+        im->w = d->width ? d->width : 1; im->h = is1d ? 1 : d->height ? d->height : 1; im->depth = is3d ? (d->depth ? d->depth : 1) : 1;
+    }
     uint32_t vstride = 0;
-    int is_vid = dm_codec_is_video_mem(im->mem, im->L.size, &vstride);
+    int is_vid = !is_tbuf && dm_codec_is_video_mem(im->mem, im->L.size, &vstride);
     if (is_vid) {
         im->is_video = 1;
         im->d.flags |= NVN_TEXTURE_FLAGS_LINEAR;
@@ -539,9 +552,9 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
     if (t->pool && pool_sparse(t->pool)) im->vpool = t->pool;
     im->pool = t->pool; im->pfin = nvn_pool_fin(); im->pgen = nvn_pool_live(t->pool, NULL, NULL);   // (the count first: a pool event in between is seen at the next check)
     // 1D and 1D-array textures are one-row 2D / 2D-array images, as nvn_mtl.m makes them: the translator declares every such read as a 2D one (no Dim1D in any DKB module),
-    // and Vulkan has no 2D view of a 1D image, so a 1D image read as unbound
-    im->layers = is3d ? 1 : t->L.layers ? t->L.layers : 1; im->levels = d->levels ? d->levels : 1; im->samples = d->samples > 1 ? (uint32_t)d->samples : 1;
-    if (base >= im->levels || is3d) base = 0;
+    // and Vulkan has no 2D view of a 1D image, so a 1D image read as unbound; BUFFER textures are 2D images of NVN_TBUF_ROW-texel rows (nvn_tbuf_rows)
+    im->layers = (is3d || is_tbuf) ? 1 : t->L.layers ? t->L.layers : 1; im->levels = is_tbuf ? 1 : d->levels ? d->levels : 1; im->samples = is_tbuf ? 1 : d->samples > 1 ? (uint32_t)d->samples : 1;
+    if (base >= im->levels || is3d || is_tbuf) base = 0;
     im->base = base; im->levels -= base; im->w = im->w >> base ? im->w >> base : 1; im->h = im->h >> base ? im->h >> base : 1;
     im->aspect = aspect_of(f->kind);
     VkFormatFeatureFlags ff = feats(f->vk);
@@ -711,13 +724,13 @@ static int nvn2_sampled_content(const tex_t *t, const vka_fmt *f, unsigned pf, i
 static uint64_t g_nvn2_first[2];   // textures taken from their storage at a first sample (nvn2_sampled_content): [0] with data, [1] storage all zero (tracked from zeros)
 static int storage_mode(const tex_t *t, const uint8_t *c, const vka_fmt *f, int cpuw, int sampled) {   // c: the storage's content as the GPU will see it (t->mem or gw_content's copy)
     const nvn_texdesc *d = &t->d;
-    if (!t->mem || d->samples > 1 || f->kind >= 3 || d->target == NVN_TEXTURE_TARGET_BUFFER) return ST_ZERO;
+    if (!t->mem || d->samples > 1 || f->kind >= 3) return ST_ZERO;
     // A sparse virtual pool's texture (nvn_mtl.m tex_from_storage): a sampled one holds what the CPU wrote into the physical pages mapped behind it (streamed textures), read
     // through the page table and uploaded again when its mappings or those pages change (ST_SPARSE); render targets and images are GPU content. Its address is reserved, inaccessible
     // memory where nothing is mapped (no host alias on Android), so mem_any and the other checks below must not read it
     int sp = 0; unsigned pf = 0; if (t->pool && !nvn_pool_live(t->pool, &pf, &sp)) return ST_ZERO;   // a finalized pool: its memory may be unmapped (treg_dead)
     if (sp) return sparse_sampled(t, f) ? ST_SPARSE : ST_ZERO;
-    int linear = (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0, comp = compressed(f);
+    int linear = d->target == NVN_TEXTURE_TARGET_BUFFER || (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0, comp = compressed(f);
     int is_vid = t->mem && dm_codec_is_video_mem(t->mem, t->L.size, NULL);
     int want = ST_ZERO;
     if (cpuw || t->has_layout) want = ST_TRACK;
@@ -872,6 +885,7 @@ static int img_pool_dead(vka_img *im) {
     uint64_t f = nvn_pool_fin(); if (f == im->pfin) return 0;
     im->pfin = f;
     if (nvn_pool_live(im->pool, NULL, NULL) == im->pgen) return 0;
+    if (im->edge_poll) { im->edge_poll = 0; if (g_nedge_poll > 0) g_nedge_poll--; }
     im->pdead = 1; im->track = 0;   // (vtrack stays: view_of's level cut follows it; every loop that refreshes checks pdead first)
     static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VLOG("texture serial %llu (storage %p): its pool %p was finalized: its image keeps its content, its storage is not read again", (unsigned long long)im->serial, (void *)im->mem, im->pool);
     return 1;
@@ -949,6 +963,14 @@ static uint64_t ft_hash(uintptr_t lo, uintptr_t hi) {
     for (; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
     return h ^ (h >> 29);
 }
+static void img_protect(const vka_img *im) {
+    if (!im || !im->mem || !im->L.size) return;
+    if (!im->edge_poll) { nvn_dirty_protect(im->mem, im->L.size); return; }
+    uintptr_t pg = nvn_dirty_block_bytes(); if (!pg) pg = (uintptr_t)getpagesize();
+    uintptr_t a = (uintptr_t)im->mem, e = a + im->L.size;
+    uintptr_t ia = (a + pg - 1) & ~(pg - 1), ie = e & ~(pg - 1);
+    if (ie > ia) nvn_dirty_protect((const void *)ia, ie - ia);
+}
 static void img_edges_take(vka_img *im) {
     if (!im) return;
     im->edged = 0;
@@ -961,7 +983,22 @@ static void img_edges_take(vka_img *im) {
     if (ie <= ia) { r[0][0] = a; r[0][1] = e; r[1][0] = r[1][1] = 0; }
     else { r[0][0] = a; r[0][1] = ia; r[1][0] = ie; r[1][1] = e; }
     for (int i = 0; i < 2; i++) im->edge_h[i] = r[i][1] > r[i][0] ? ft_hash(r[i][0], r[i][1]) : 0;
-    im->edged = !nvn_dirty_since_span(im->span, im->mem, im->L.size, im->stamp);
+    im->edged = im->edge_poll ? !(ie > ia && nvn_dirty_since_span(im->span, (const void *)ia, ie - ia, im->stamp)) : !nvn_dirty_since_span(im->span, im->mem, im->L.size, im->stamp);
+}
+static int img_edge_poll_dirty(vka_img *im, size_t *lo, size_t *hi) {
+    if (!im || !im->edge_poll || !im->edged || im->vpool || !im->span || !im->mem) return 0;
+    if (dm_guest_unmapped((uintptr_t)im->mem, im->L.size)) return 0;
+    uintptr_t pg = nvn_dirty_block_bytes(); if (!pg) pg = (uintptr_t)getpagesize();
+    uintptr_t r[2][2], a = (uintptr_t)im->mem, e = a + im->L.size;
+    uintptr_t ia = (a + pg - 1) & ~(pg - 1), ie = e & ~(pg - 1);
+    if (ie <= ia) { r[0][0] = a; r[0][1] = e; r[1][0] = r[1][1] = 0; }
+    else { r[0][0] = a; r[0][1] = ia; r[1][0] = ie; r[1][1] = e; }
+    int h0_bad = (r[0][1] > r[0][0] && ft_hash(r[0][0], r[0][1]) != im->edge_h[0]);
+    int h1_bad = (r[1][1] > r[1][0] && ft_hash(r[1][0], r[1][1]) != im->edge_h[1]);
+    if (!h0_bad && !h1_bad) return 0;
+    *lo = h0_bad ? 0 : (size_t)(r[1][0] - a);
+    *hi = h1_bad ? (size_t)(r[1][1] - a) : (size_t)(r[0][1] - a);
+    return 1;
 }
 static int img_edges_clean(vka_img *im) {
     if (!im || !im->edged || im->vpool || !im->span || !im->mem) return 0;
@@ -973,20 +1010,24 @@ static int img_edges_clean(vka_img *im) {
     if (ie <= ia) { r[0][0] = a; r[0][1] = e; r[1][0] = r[1][1] = 0; ia = ie = 0; }
     else { r[0][0] = a; r[0][1] = ia; r[1][0] = ie; r[1][1] = e; }
     uint64_t st = nvn_dirty_now();
-    nvn_dirty_protect(im->mem, im->L.size);
     int in_dirty = (ie > ia && nvn_dirty_since_span(im->span, (const void *)ia, ie - ia, im->stamp));
     int h0_bad = (r[0][1] > r[0][0] && ft_hash(r[0][0], r[0][1]) != im->edge_h[0]);
     int h1_bad = (r[1][1] > r[1][0] && ft_hash(r[1][0], r[1][1]) != im->edge_h[1]);
-    if (in_dirty || h0_bad || h1_bad) return 0;
+    if (in_dirty || h0_bad || h1_bad) {
+        img_protect(im);
+        return 0;
+    }
+    if (!im->edge_poll) { im->edge_poll = 1; g_nedge_poll++; }
     im->stamp = st;
+    img_protect(im);
     img_edges_take(im);
     static uint64_t g_edge_skips;
-    if (++g_edge_skips <= 8) VLOG("texture serial %llu %ux%u format %#x: only shared pages written beside it, re-upload skipped (%llu so far)",
+    if (++g_edge_skips <= 8) VLOG("texture serial %llu %ux%u format %#x: only shared pages written beside it, re-upload skipped (%llu so far; boundary pages switched to frame poll)",
                                   (unsigned long long)im->serial, im->w, im->h, im->d.format, (unsigned long long)g_edge_skips);
     return 1;
 }
 static void upload_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb) {   // stamp, protect, then read (nvn_mtl.m pkg_upload): a write during the copy is seen at the next check
-    im->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size);
+    im->stamp = nvn_dirty_now(); img_protect(im);
     img_edges_take(im);
     if (vka_nan_on()) im->hash = mem_hash(t->mem, t->L.size);
     uint8_t *c = im->vpool ? NULL : gw_content(t->mem, t->L.size, &im->gw_seen);   // (a sparse pool's storage is read through its page table: upload_)
@@ -1004,15 +1045,20 @@ static void upload_fill(vka_img *im, const tex_t *t, VkCommandBuffer cb) {   // 
 // 1024x8192 R8: the whole 8 MB was deswizzled and copied each time a glyph was rasterized into it). 0 = not such a texture (the caller uploads all of it)
 static int upload_rows_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb, size_t lo, size_t hi) {
     const nvn_texdesc *d = &t->d; const vka_fmt *f = &im->f;
-    if (!(im->is_video || (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) || im->levels > 1 || im->layers > 1 || im->depth > 1 || f->kind >= 3) return 0;
+    if (!(im->is_video || d->target == NVN_TEXTURE_TARGET_BUFFER || (im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) || im->levels > 1 || im->layers > 1 || im->depth > 1 || f->kind >= 3) return 0;
     uint32_t bx = (im->w + f->bw - 1) / f->bw, by = (im->h + f->bh - 1) / f->bh; size_t pitch = (size_t)bx * f->bpb, st = im->d.stride ? im->d.stride : d->stride ? d->stride : pitch;
     if (st < pitch) return 0;
     uint32_t r0 = (uint32_t)(lo / st), r1 = (uint32_t)((hi + st - 1) / st); if (r1 > by) r1 = by;
     if (r0 >= r1) r0 = 0, r1 = by;
-    im->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size);   // stamp, protect, then read (upload_tracked)
+    im->stamp = nvn_dirty_now(); img_protect(im);   // stamp, protect, then read (upload_tracked)
     img_edges_take(im);
     vka_span s; if (!vka_scratch(pitch * (r1 - r0), 16, &s)) return 1;
-    for (uint32_t y = r0; y < r1; y++) memcpy(s.ptr + (size_t)(y - r0) * pitch, t->mem + (size_t)y * st, pitch);
+    size_t sz = t->L.size;
+    for (uint32_t y = r0; y < r1; y++) {
+        size_t off = (size_t)y * st, cp = off < sz ? (sz - off < pitch ? sz - off : pitch) : 0;
+        if (cp) memcpy(s.ptr + (size_t)(y - r0) * pitch, t->mem + off, cp);
+        if (cp < pitch) memset(s.ptr + (size_t)(y - r0) * pitch + cp, 0, pitch - cp);
+    }
     uint32_t y0 = r0 * f->bh, y1 = r1 * f->bh > im->h ? im->h : r1 * f->bh;
     VkBufferImageCopy c = {s.off, bx * f->bw, (r1 - r0) * f->bh, {im->aspect, 0, 0, 1}, {0, (int32_t)y0, 0}, {im->w, y1 - y0, 1}};
     vk.vkCmdCopyBufferToImage(cb, s.buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
@@ -1025,13 +1071,13 @@ static int upload_rows_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb, 
 // texture again. 0 = not such a texture, or content the GPU has pending writes over (the caller uploads all of it)
 static int upload_bands_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb, size_t lo, size_t hi, uint64_t old) {
     const nvn_texdesc *d = &t->d; const vka_fmt *f = &im->f;
-    if (!VKA_ENV("DM_VK_BANDS", 1) || im->vpool || im->m.z || im->is_video || vka_nan_on() || f->kind >= 3 || d->target == NVN_TEXTURE_TARGET_3D || im->depth > 1 ||
-        (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || im->L.size < (1u << 20)) return 0;
+    if (!VKA_ENV("DM_VK_BANDS", 1) || im->vpool || im->m.z || im->is_video || vka_nan_on() || f->kind >= 3 || d->target == NVN_TEXTURE_TARGET_3D || d->target == NVN_TEXTURE_TARGET_BUFFER || im->depth > 1 ||
+        (im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || im->L.size < (1u << 20)) return 0;
     uint64_t seen; uint8_t *c = gw_content(t->mem, t->L.size, &seen);
     if (c) { free(c); return 0; }
     if ((c = unmapped_content(t))) { free(c); return 0; }
     im->gw_seen = seen;
-    im->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size);   // stamp, protect, then read (upload_tracked)
+    im->stamp = nvn_dirty_now(); img_protect(im);   // stamp, protect, then read (upload_tracked)
     img_edges_take(im);
     uint64_t up = 0;
     uint8_t *bst = NULL; uint32_t bst_cap = 0;
@@ -1825,7 +1871,7 @@ static int up_parallel(up_part *p, uint32_t n, int *fail) {
 static int upload_mt(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *nbytes) {
     const nvn_texdesc *d = &t->d; const vka_fmt *f = &im->f;
     int is3d = d->target == NVN_TEXTURE_TARGET_3D;
-    if (vka_nan_on() || im->is_video || (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || f->kind >= 3) return 0;
+    if (vka_nan_on() || im->is_video || d->target == NVN_TEXTURE_TARGET_BUFFER || (im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || f->kind >= 3) return 0;
     uint64_t total = 0; uint32_t npieces = im->levels * im->layers;
     for (uint32_t lv = 0; lv < im->levels; lv++) {
         uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1, z = is3d ? (im->depth >> lv ? im->depth >> lv : 1) : 1;
@@ -1880,7 +1926,7 @@ static void upload(vka_img *im, const tex_t *t, VkCommandBuffer cb) {   // (call
 static void upload_(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *nbytes) {
     if (!im->vpool && upload_mt(im, t, cb, nbytes)) return;   // (a sparse pool's storage is read through its page table below, never at its address)
     const nvn_texdesc *d = &t->d; const vka_fmt *f = &im->f;
-    int linear = im->is_video || (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)), is3d = d->target == NVN_TEXTURE_TARGET_3D;
+    int linear = im->is_video || d->target == NVN_TEXTURE_TARGET_BUFFER || (im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)), is3d = d->target == NVN_TEXTURE_TARGET_3D;
     if (f->kind >= 3) { VRED_ONCE("depth / stencil textures are not uploaded from guest memory yet (format %#x)", d->format); return; }
     if (linear && (im->levels > 1 || im->layers > 1 || is3d)) { VRED_ONCE("linear texture with levels or layers (format %#x %ux%u): only level 0 uploaded", d->format, d->width, d->height); }
     uint64_t bytes = 0;
@@ -1893,7 +1939,14 @@ static void upload_(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *n
         size_t pitch = (size_t)bx * f->bpb, piece = pitch * by * z;
         for (uint32_t ly = 0; ly < (linear ? 1 : im->layers); ly++) {
             vka_span s; if (!vka_scratch(piece, 16, &s)) { free(part); return; }
-            if (linear) { size_t st = im->d.stride ? im->d.stride : d->stride ? d->stride : pitch; for (uint32_t y = 0; y < by; y++) memcpy(s.ptr + y * pitch, src + y * st, pitch); }
+            if (linear) {
+                size_t st = im->d.stride ? im->d.stride : d->stride ? d->stride : pitch, sz = t->L.size;
+                for (uint32_t y = 0; y < by; y++) {
+                    size_t off = (size_t)y * st, cp = off < sz ? (sz - off < pitch ? sz - off : pitch) : 0;
+                    if (cp) memcpy(s.ptr + (size_t)y * pitch, src + off, cp);
+                    if (cp < pitch) memset(s.ptr + (size_t)y * pitch + cp, 0, pitch - cp);
+                }
+            }
             else if (nvn_deswizzle(d, lv + im->base, ly, src, s.ptr, pitch)) { VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)t->serial, d->format, d->target); free(part); return; }   // (image level lv is texture level lv + base: a soft texture's; a sparse pool's go above)
             if (d->format >= 0x79 && d->format <= 0x94 && vka_nan_on()) {   // DM_VK_NANSCAN: all-zero blocks of ASTC textures (an all-zero ASTC block is an error block)
                 uint64_t zb = 0, nb = piece / 16; for (uint64_t k = 0; k < nb; k++) if (!mem_any(s.ptr + 16 * k, 16)) zb++;
@@ -1950,7 +2003,7 @@ void vka_img_written_at(vka_img *im, const char *file, int line) {
              im->w, im->h, im->layers, im->d.format, im->m.size / 1048576.0, (unsigned long long)vka_frame(), file, line, im->nsamp, im->novl); }
     im->gpu_owned = 1;
     im->last_fence = vka_fence_last();
-    if ((im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) && im->mem && !im->wb_pending && im->samples == 1 && im->f.kind < 3 && im->f.bw == 1) {
+    if (im->d.target != NVN_TEXTURE_TARGET_BUFFER && (im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) && im->mem && !im->wb_pending && im->samples == 1 && im->f.kind < 3 && im->f.bw == 1) {
         if (g_nwb == g_wbcap) { g_wbcap = g_wbcap ? 2 * g_wbcap : 32; g_wb = realloc(g_wb, (size_t)g_wbcap * sizeof *g_wb); }
         im->wb_pending = 1; im->refs++; g_wb[g_nwb++] = im;
     }
@@ -2903,10 +2956,10 @@ void vka_tex_prepare(VkCommandBuffer cb) {
     // Video pictures: the scan below runs when a picture was written into a video pool or a pool came or went since the last one (before 2026-11-10 every live image
     // was asked dm_codec_is_video_mem, a lock and 64 slots, at every submission to find that out, and again in the scan: "Live images" above); an image is asked again
     // only after a pool came or went (vka_img.vep). The counts are read before the scan, so a picture written during it moves them for the next submission
-    static uint64_t seen, vseen, vw_seen, ve_seen; uint64_t now = nvn_dirty_now(), vnow = nvn_sparse_gen(), vw = dm_codec_video_writes(), ve = dm_codec_video_epoch();
-    int vid_new = vw != vw_seen || ve != ve_seen;
-    if (now != seen || vnow != vseen || vid_new) {
-        seen = now; vseen = vnow; vw_seen = vw; ve_seen = ve;
+    static uint64_t seen, vseen, vw_seen, ve_seen, edge_fseen; uint64_t now = nvn_dirty_now(), vnow = nvn_sparse_gen(), vw = dm_codec_video_writes(), ve = dm_codec_video_epoch(), cur_f = vka_frame();
+    int vid_new = vw != vw_seen || ve != ve_seen, edge_new = g_nedge_poll > 0 && cur_f != edge_fseen;
+    if (now != seen || vnow != vseen || vid_new || edge_new) {
+        seen = now; vseen = vnow; vw_seen = vw; ve_seen = ve; edge_fseen = cur_f;
         for (int i = 0; i < g_nlive; i++) {
             vka_img *im = g_live[i];
             if (img_pool_dead(im)) continue;
@@ -2947,10 +3000,11 @@ void vka_tex_prepare(VkCommandBuffer cb) {
             if (!im->track || im->gpu_owned || !im->mem) continue;
             uint64_t size = im->L.size;
             if (!im->span) im->span = nvn_dirty_span(im->mem, size);
-            if (!nvn_dirty_since_span(im->span, im->mem, size, im->stamp)) continue;
-            if (img_edges_clean(im)) continue;
-            size_t lo, hi;
-            if (!nvn_dirty_bounds_since(im->span, im->mem, size, im->stamp, &lo, &hi)) continue;
+            size_t lo = 0, hi = 0;
+            if (nvn_dirty_since_span(im->span, im->mem, size, im->stamp)) {
+                if (img_edges_clean(im)) continue;
+                if (!nvn_dirty_bounds_since(im->span, im->mem, size, im->stamp, &lo, &hi)) continue;
+            } else if (!img_edge_poll_dirty(im, &lo, &hi)) continue;
             tex_t t = {0}; t.serial = im->serial; t.d = im->d; t.L = im->L; t.mem = (uint8_t *)im->mem;
             int rows = VKA_ENV("DM_VK_ROWS", 1);
             if (rows && upload_rows_tracked(im, &t, cb, lo, hi)) continue;
