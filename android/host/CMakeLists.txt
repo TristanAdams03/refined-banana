@@ -91,10 +91,10 @@ function(nxhost_add tgt game)
   target_compile_definitions(${tgt} PRIVATE _GNU_SOURCE DM_NUP_ZSTD $<$<BOOL:${NX_LSFG}>:NX_LSFG>)
   # As the Mac host (-O1 -g -Wall -Wno-unused-function). Hidden visibility: the assembly reaches C symbols with adrp, which a shared library allows only for symbols it binds itself
   # -Wno-format: the host prints uint64_t with %ll* (unsigned long long on Darwin, unsigned long on Linux: the same 64 bits)
-  target_compile_options(${tgt} PRIVATE -O2 -mcpu=cortex-x3 -g -Wall -Wno-unused-function -Wno-format -fvisibility=hidden)
-  # The replay's draw path, NVN front, dirty tracker, and texture deswizzler run on the hot frame path: -O3 -mcpu=cortex-x3
+  target_compile_options(${tgt} PRIVATE -O1 -g -Wall -Wno-unused-function -Wno-format -fvisibility=hidden)
+  # The replay's draw path runs per draw (thousands a frame): -O2 there (the rest stays at the Mac host's -O1, a later option wins)
   file(GLOB VKA_C ${GFX}/vk_android/*.c ${GFX}/nvn/*.c ${GFX}/tex/*.c)
-  set_source_files_properties(${VKA_C} PROPERTIES COMPILE_OPTIONS "-O3;-mcpu=cortex-x3")
+  set_source_files_properties(${VKA_C} PROPERTIES COMPILE_OPTIONS -O2)
   target_link_options(${tgt} PRIVATE -Wl,-Bsymbolic -Wl,--no-undefined -Wl,--error-limit=0 -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/libnxhost.map)
   set_target_properties(${tgt} PROPERTIES LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/libnxhost.map)
   target_link_libraries(${tgt} PRIVATE vpx dav1d zstddec aaudio mediandk android log m dl z)   # libvulkan.so is opened at run time (vka_dev.c)
