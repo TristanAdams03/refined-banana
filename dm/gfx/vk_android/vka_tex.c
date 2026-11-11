@@ -767,16 +767,19 @@ static uint64_t mem_hash(const uint8_t *p, uint64_t n) { uint64_t h = 1469598103
 // Images whose content is the GPU's (gpu_owned: render targets, copy destinations) keep it, as for CPU writes
 enum { GW_COPY, GW_FILL, GW_UPDATE, GW_OPAQUE };
 typedef struct { uint64_t lo, hi, src, seq, fence; uint32_t kind, value; uint8_t *data; } gw_t;
-static gw_t *g_gw; static int g_ngw, g_gwcap; static uint64_t g_gwseq = 1, g_gw_redo, g_gw_over, g_gw_late;
+static gw_t *g_gw; static int g_ngw, g_gwcap; static uint64_t g_gwseq = 1, g_gw_redo, g_gw_over, g_gw_late, g_gw_gpu_sync;
+static _Atomic uint64_t g_gw_uncom_seq; static uint64_t g_gw_sync_seq, g_gw_sync_lgen;
 static void gw_add(int kind, uint64_t dst, uint64_t n, uint64_t src, uint32_t value, const void *data) {
     if (!n) return;
     pthread_mutex_lock(&g_tmu);
     if (g_ngw == g_gwcap) { g_gwcap = g_gwcap ? 2 * g_gwcap : 256; g_gw = realloc(g_gw, (size_t)g_gwcap * sizeof *g_gw); }
     if (kind == GW_OPAQUE)   // the same range again in this submission (a storage buffer bound by draw after draw): one entry, at the newest place
         for (int i = g_ngw - 1; i >= 0 && i >= g_ngw - 16 && !g_gw[i].fence; i--) if (g_gw[i].kind == GW_OPAQUE && g_gw[i].lo == dst && g_gw[i].hi == dst + n) {
-            gw_t w = g_gw[i]; memmove(&g_gw[i], &g_gw[i + 1], (size_t)(g_ngw - 1 - i) * sizeof *g_gw); w.seq = g_gwseq++; g_gw[g_ngw - 1] = w; pthread_mutex_unlock(&g_tmu); return; }
+            gw_t w = g_gw[i]; memmove(&g_gw[i], &g_gw[i + 1], (size_t)(g_ngw - 1 - i) * sizeof *g_gw); w.seq = g_gwseq++; g_gw[g_ngw - 1] = w;
+            atomic_store_explicit(&g_gw_uncom_seq, g_gwseq - 1, memory_order_release); pthread_mutex_unlock(&g_tmu); return; }
     uint8_t *cp = NULL; if (kind == GW_UPDATE && (cp = malloc(n))) memcpy(cp, data, n); else if (kind == GW_UPDATE) kind = GW_OPAQUE;
     g_gw[g_ngw++] = (gw_t){dst, dst + n, src, g_gwseq++, 0, (uint32_t)kind, value, cp};
+    atomic_store_explicit(&g_gw_uncom_seq, g_gwseq - 1, memory_order_release);
     pthread_mutex_unlock(&g_tmu);
 }
 void vka_tex_gw_copy(uint64_t src, uint64_t dst, uint64_t n) { gw_add(GW_COPY, dst, n, src, 0, NULL); }
@@ -922,6 +925,7 @@ void vka_tex_gw_commit(uint64_t fence) {   // the writes recorded since the last
     pthread_mutex_lock(&g_tmu);
     for (int i = g_ngw - 1; i >= 0 && !g_gw[i].fence; i--) g_gw[i].fence = fence;
     for (int i = 0; i < GML_N; i++) if (g_gml[i].used && !g_gml[i].fence) g_gml[i].fence = fence;
+    atomic_store_explicit(&g_gw_uncom_seq, 0, memory_order_release);
     pthread_mutex_unlock(&g_tmu);
 }
 // The storage [mem, mem + n) as the GPU sees it after the writes recorded so far: NULL = memory as it is (no pending write over it), else a malloc'd copy with the pending writes
@@ -1043,6 +1047,97 @@ static void upload_fill(vka_img *im, const tex_t *t, VkCommandBuffer cb) {   // 
 }
 // A linear 2D texture of one level and layer whose pages the CPU wrote between byte lo and hi of its storage: only those rows again (Donkey Kong Bananza's glyph cache,
 // 1024x8192 R8: the whole 8 MB was deswizzled and copied each time a glyph was rasterized into it). 0 = not such a texture (the caller uploads all of it)
+// Direct GPU buffer-to-image copy from a placed guest memory pool buffer (no CPU staging or memcpy): used for linear / NVN_TEXTURE_TARGET_BUFFER textures whose
+// guest storage is backed by a placed VkBuffer. Handles partial last rows when a texture buffer's byte size is not a multiple of the 2D row stride (nvn_tbuf_rows)
+static int img_gpu_buf_copy_range(vka_img *im, VkCommandBuffer cb, size_t lo, size_t hi, uint64_t *nbytes) {
+    if (!im || !cb || !im->mem || im->vpool || im->m.z || !VKA_ENV("DM_VK_BUF_IMG_COPY", 1)) return 0;
+    const vka_fmt *f = &im->f;
+    int linear = im->is_video || im->d.target == NVN_TEXTURE_TARGET_BUFFER || (im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET));
+    if (!linear || im->levels > 1 || im->layers > 1 || im->depth > 1 || im->samples > 1 || f->kind >= 3 || f->bw > 1 || f->bh > 1) return 0;
+    uint32_t bpb = f->bpb;
+    size_t pitch = (size_t)im->w * bpb, st = im->d.stride ? im->d.stride : pitch, sz = im->L.size;
+    if (!bpb || st < pitch || st % bpb != 0 || !sz) return 0;
+    uint32_t r0 = (uint32_t)(lo / st), r1 = (uint32_t)((hi + st - 1) / st);
+    if (r1 > im->h) r1 = im->h;
+    if (r0 >= r1) { r0 = 0; r1 = im->h; }
+    uint32_t full_h = (uint32_t)(sz / st), rem_w = (uint32_t)((sz % st) / bpb);
+    if (full_h > im->h) { full_h = im->h; rem_w = 0; }
+    else if (full_h == im->h) rem_w = 0;
+    VkDeviceSize need = (VkDeviceSize)full_h * st + (VkDeviceSize)rem_w * bpb;
+    if (!need) return 0;
+    VkBuffer b; VkDeviceSize o;
+    if (!vka_addr_run((uint64_t)(uintptr_t)im->mem, need, &b, &o) || o % (bpb % 4 ? 4 * bpb : bpb) != 0) return 0;
+    VkBufferImageCopy rg[2]; uint32_t nrg = 0; uint64_t copied = 0;
+    uint32_t fh1 = r1 < full_h ? r1 : full_h;
+    if (r0 < fh1) {
+        rg[nrg++] = (VkBufferImageCopy){o + (VkDeviceSize)r0 * st, (uint32_t)(st / bpb), fh1 - r0, {im->aspect, 0, 0, 1}, {0, (int32_t)r0, 0}, {im->w, fh1 - r0, 1}};
+        copied += (uint64_t)(fh1 - r0) * pitch;
+    }
+    if (r1 > full_h && rem_w > 0 && full_h < im->h) {
+        rg[nrg++] = (VkBufferImageCopy){o + (VkDeviceSize)full_h * st, (uint32_t)(st / bpb), 1, {im->aspect, 0, 0, 1}, {0, (int32_t)full_h, 0}, {rem_w, 1, 1}};
+        copied += (uint64_t)rem_w * bpb;
+    }
+    if (!nrg) return 0;
+    vk.vkCmdCopyBufferToImage(cb, b, im->img, VK_IMAGE_LAYOUT_GENERAL, nrg, rg);
+    if (nbytes) *nbytes = copied;
+    return 1;
+}
+// Synchronize uncommitted GPU writes (compute storage buffer stores, buffer copies/fills/updates) into overlapping linear / NVN_TEXTURE_TARGET_BUFFER images in the same
+// submission before subsequent draws or dispatches sample them, avoiding 1-3 frame stale texture buffer reads and eliminating CPU dirty-page mprotect faults on GPU-written buffers
+void vka_tex_gw_sync(VkCommandBuffer cb) {
+    if (!cb || !VKA_ENV("DM_VK_GW_SYNC", 1)) return;
+    uint64_t u = atomic_load_explicit(&g_gw_uncom_seq, memory_order_acquire);
+    if (!u || (u == g_gw_sync_seq && g_gw_sync_lgen == g_live_gen)) return;
+    nvn_pool_use(1);
+    pthread_mutex_lock(&g_tmu);
+restart:;
+    int any = 0;
+    for (int i = g_ngw - 1; i >= 0 && !g_gw[i].fence; i--) { any = 1; break; }
+    if (!any) { g_gw_sync_seq = u; g_gw_sync_lgen = g_live_gen; pthread_mutex_unlock(&g_tmu); nvn_pool_use(0); return; }
+    static vka_img **by; static int bycap, nall; static uint64_t by_gen = ~0ull; uint64_t maxsz = 0;
+    #define GW_SYNC_TAKES(im) ((im)->from_mem && !(im)->gpu_owned && (im)->mem && !(im)->vpool && !img_pool_dead(im))
+    if (bycap < g_nlive) { bycap = g_nlive + 256; by = realloc(by, (size_t)bycap * sizeof *by); by_gen = ~0ull; }
+    if (by_gen != g_live_gen) { nall = 0; for (int j = 0; j < g_nlive; j++) if (g_live[j]->mem) by[nall++] = g_live[j]; qsort(by, (size_t)nall, sizeof *by, img_by_mem); by_gen = g_live_gen; }
+    for (int j = 0; j < nall; j++) if (GW_SYNC_TAKES(by[j]) && by[j]->L.size > maxsz) maxsz = by[j]->L.size;
+    int first_uncom = g_ngw;
+    while (first_uncom > 0 && !g_gw[first_uncom - 1].fence) first_uncom--;
+    int copied = 0;
+    for (int i = first_uncom; i < g_ngw; i++) {
+        gw_t *w = &g_gw[i];
+        int lo = 0, hi = nall;
+        while (lo < hi) { int m = (lo + hi) / 2; if ((uint64_t)(uintptr_t)by[m]->mem < w->hi) lo = m + 1; else hi = m; }
+        for (int j = lo - 1; j >= 0 && (uint64_t)(uintptr_t)by[j]->mem + maxsz > w->lo; j--) {
+            vka_img *im = by[j]; uint64_t a = (uint64_t)(uintptr_t)im->mem;
+            if (w->lo >= a + im->L.size || im->gw_seen >= w->seq || !GW_SYNC_TAKES(im)) continue;
+            if (!copied && cb == vka_rp_cb() && vka_rp_is_open()) {
+                pthread_mutex_unlock(&g_tmu); nvn_pool_use(0);
+                vka_rp_end();
+                nvn_pool_use(1); pthread_mutex_lock(&g_tmu);
+                goto restart;
+            }
+            if (!copied) { vka_barrier(cb); copied = 1; }
+            size_t rlo = w->lo > a ? (size_t)(w->lo - a) : 0, rhi = w->hi < a + im->L.size ? (size_t)(w->hi - a) : (size_t)im->L.size;
+            uint64_t nb = 0;
+            if (img_gpu_buf_copy_range(im, cb, rlo, rhi, &nb)) {
+                im->gw_seen = w->seq;
+                if (im->track) {
+                    nvn_dirty_unprotect(im->mem, im->L.size);
+                    if (im->edge_poll) { im->edge_poll = 0; if (g_nedge_poll > 0) g_nedge_poll--; }
+                    im->track = 0; im->mode = ST_FILL;
+                }
+                g_gw_gpu_sync++;
+                if (g_gw_gpu_sync <= 8) VLOG("texture serial %llu %ux%u format %#x: synced in-submission from GPU buffer write (%#llx+%#llx, %llu bytes)",
+                                             (unsigned long long)im->serial, im->w, im->h, im->d.format, (unsigned long long)w->lo, (unsigned long long)(w->hi - w->lo), (unsigned long long)nb);
+            }
+        }
+    }
+    #undef GW_SYNC_TAKES
+    if (copied) vka_barrier(cb);
+    g_gw_sync_seq = g_gwseq - 1;
+    g_gw_sync_lgen = g_live_gen;
+    pthread_mutex_unlock(&g_tmu);
+    nvn_pool_use(0);
+}
 static int upload_rows_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb, size_t lo, size_t hi) {
     const nvn_texdesc *d = &t->d; const vka_fmt *f = &im->f;
     if (!(im->is_video || d->target == NVN_TEXTURE_TARGET_BUFFER || (im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) || im->levels > 1 || im->layers > 1 || im->depth > 1 || f->kind >= 3) return 0;
@@ -1052,6 +1147,8 @@ static int upload_rows_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb, 
     if (r0 >= r1) r0 = 0, r1 = by;
     im->stamp = nvn_dirty_now(); img_protect(im);   // stamp, protect, then read (upload_tracked)
     img_edges_take(im);
+    uint64_t nb = 0;
+    if (t->mem == im->mem && img_gpu_buf_copy_range(im, cb, lo, hi, &nb)) { g_rows_up += nb; return 1; }
     vka_span s; if (!vka_scratch(pitch * (r1 - r0), 16, &s)) return 1;
     size_t sz = t->L.size;
     for (uint32_t y = r0; y < r1; y++) {
@@ -1932,6 +2029,7 @@ static void upload_(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *n
     uint64_t bytes = 0;
     // A sparse pool's texture: gathered from its page table by bands, unmapped ones as zero texels (until 2026-11-03 a copy of its whole range was made first)
     if (im->vpool) { if (!im->vbind) upload_sparse_parts(im, cb, 0, 0, 1, 0); return; }   // (a GPU-written one's content is the GPU's: sparse_bind)
+    if (linear && t->mem == im->mem && img_gpu_buf_copy_range(im, cb, 0, t->L.size, nbytes)) return;
     uint8_t *part = NULL; const uint8_t *src = t->mem;
     for (uint32_t lv = 0; lv < (linear ? 1 : im->levels); lv++) {
         uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1, z = is3d ? (im->depth >> lv ? im->depth >> lv : 1) : 1;
@@ -2940,8 +3038,13 @@ void vka_tex_prepare(VkCommandBuffer cb) {
                 vka_img *im = by[j]; uint64_t a = (uint64_t)(uintptr_t)im->mem;
                 if (w->lo >= a + im->L.size || im->gw_seen >= w->seq || im->gpu_owned) continue;
                 if (keep && !GW_TAKES(im)) continue;
+                if (im->track) {
+                    nvn_dirty_unprotect(im->mem, im->L.size);
+                    if (im->edge_poll) { im->edge_poll = 0; if (g_nedge_poll > 0) g_nedge_poll--; }
+                    im->track = 0; im->mode = ST_FILL;
+                }
                 tex_t t = {0}; t.serial = im->serial; t.d = im->d; t.L = im->L; t.mem = (uint8_t *)im->mem;
-                if (im->track) upload_tracked(im, &t, cb); else upload_fill(im, &t, cb);
+                upload_fill(im, &t, cb);
                 g_gw_late++; if (g_gw_late <= 8 || !(g_gw_late & (g_gw_late - 1))) VLOG("textures re-uploaded after a GPU write into their storage: %llu (uploads that applied pending GPU writes: %llu; pages raw global memory stores wrote: %llu)", (unsigned long long)g_gw_late, (unsigned long long)g_gw_over, (unsigned long long)g_gml_pages);
                 if (g_gw_late <= 8) VLOG("texture serial %llu %ux%u format %#x: a GPU write into its storage (%s %#llx+%#llx) is done, re-uploaded", (unsigned long long)im->serial, im->w, im->h, im->d.format,
                                           w->kind == GW_COPY ? "copy" : w->kind == GW_FILL ? "fill" : w->kind == GW_UPDATE ? "inline update" : "store", (unsigned long long)w->lo, (unsigned long long)(w->hi - w->lo));

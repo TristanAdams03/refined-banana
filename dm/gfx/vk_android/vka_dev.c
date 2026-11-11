@@ -989,9 +989,11 @@ void vka_floor_span(uint64_t frame, uint64_t ns) {           // the completion t
 }
 uint64_t vka_floor_span_of(uint64_t frame) { unsigned k = frame % FSPAN; return atomic_load(&g_fspan_f[k]) == frame ? atomic_load(&g_fspan[k]) : 0; }   // 0 = not in (vka_perf.c DM_VK_ADPF_SPAN)
 static int cmp_u64(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
+static int g_kg_host;
 static int floor_auto(int top, uint64_t f) {
     static int cur = -1; static uint64_t last_f, changed_f;
-    if (cur < 0 || cur > top) cur = top;
+    if (cur < 0) cur = g_kg_host ? 0 : top;
+    if (cur > top) cur = top;
     if (f == last_f) return cur;
     last_f = f;
     uint64_t v[30]; int n = 0;
@@ -1088,10 +1090,10 @@ void vka_kgsl_after(int has_hint) {
     else VLOG("GPU clock floor through KGSL: %s", g_kg_nfd ? "no kernel context of the device's own (the ADPF floor)" : "no /dev/kgsl-3d0 descriptor (not an Adreno with KGSL; the ADPF floor)");
 }
 int vka_floor_kgsl(void) { return !V.perf_hint && g_kg_n > 0; }
-static VkResult kg_apply(int s) {   // the floor s % (0: none) on the queue's contexts
+static VkResult kg_apply(int s) {   // the floor s % (0: none) on the queue's contexts; on host-DCVS GPUs (only "highest" exists), engage only at 100 % so auto steps <100 % use the governor
     int bad = 0;
     for (int k = 0; k < g_kg_n; k++) {
-        int r = s <= 0 ? kg_set(g_kg[k].fd, g_kg[k].id, 0, 0) : kg_set(g_kg[k].fd, g_kg[k].id, 1, s >= 100 || g_kg_host ? 1u : (unsigned)(s < 2 ? 2 : s));
+        int r = (s <= 0 || (g_kg_host && s < 100)) ? kg_set(g_kg[k].fd, g_kg[k].id, 0, 0) : kg_set(g_kg[k].fd, g_kg[k].id, 1, s >= 100 || g_kg_host ? 1u : (unsigned)(s < 2 ? 2 : s));
         if (r) { bad = r; static int n; if (n++ < 3) VRED("KGSL power constraint %d %% on context %u: %d", s, g_kg[k].id, r); }
     }
     return bad ? VK_ERROR_UNKNOWN : VK_SUCCESS;
@@ -1128,7 +1130,7 @@ static void floor_set_(int s, int tail, int again) {   // again: send it even if
 // every such submission handed over has completed. A submission is counted when its span op is posted (vka_floor_tail_add) and the count is given back by that op on
 // completion, so the two always pair: before 2026-11-03 every completed submission with draws took one off, also those committed before a live switch to mode 2 or whose
 // end failed, and the floor could drop with a counted submission still on the GPU
-static int floor_mode(void) { return V.perf_hint || g_kg_n ? VKA_ENV("DM_VK_GPU_FLOOR_AUTO", 0) : -1; }
+static int floor_mode(void) { return V.perf_hint || g_kg_n ? VKA_ENV("DM_VK_GPU_FLOOR_AUTO", 1) : -1; }
 static int floor_top(void) { int s = VKA_ENV("DM_VK_GPU_FLOOR", 100); return s < 0 ? 0 : s > 100 ? 100 : s; }
 // The floor without VK_QCOM_queue_perf_hint and without the KGSL constraint above (a driver that is not on KGSL, or DM_VK_GPU_FLOOR_KGSL=0): the ADPF session (vka_perf.c) reports each frame's span (recording start to the GPU end of
 // its last submission) with its GPU time against the shortest period, so the system raises the clocks the frame's work runs on when the frame takes longer than the period

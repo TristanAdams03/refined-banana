@@ -175,6 +175,7 @@ static void prep_write(void *addr, size_t len) {
         release_pages(r, p, q, &g_preps);
     }
 }
+void nvn_dirty_unprotect(const void *addr, size_t len) { prep_write((void *)addr, len); }
 
 void nvn_dirty_add_range(const void *mem, size_t size) {
     static int inited;

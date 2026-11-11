@@ -8,6 +8,7 @@ void nvn_dirty_stat(int *live, int *peak, int *cap);                // number of
 void nvn_dirty_remove_range(const void *mem);                     // Pool destruction: restore protected pages to writable and mark invalid
 int nvn_dirty_tracked(const void *addr, size_t len);
 void nvn_dirty_protect(const void *addr, size_t len);              // Set the covered pages read-only
+void nvn_dirty_unprotect(const void *addr, size_t len);            // Restore covered protected pages to writable (e.g. when a texture stops tracking its storage)
 void nvn_dirty_hold(const void *addr, size_t len);                 // Unprotect (and stamp) every protected page of [addr, addr+len) and protect nothing more until nvn_dirty_unhold
 void nvn_dirty_unhold(void);                                      // (a placement swapping those pages, vka_mem.c place: the tracker's protections must not change under it)
 size_t nvn_dirty_block_at_least(size_t bytes);                     // Protection changes in blocks of at least bytes from now on (a power of two; only grows); the block size in force
